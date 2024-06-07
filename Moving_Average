@@ -1,0 +1,35 @@
+MatLab code for Moving Average Prediction
+
+file1="7train1.csv"
+file2="7train2.csv"
+file3="bus57.csv"
+
+%load data
+dataTable = readtable(file1, 'ReadVariableNames', false);
+bandwidth = (dataTable.Var1)';
+
+%cope with size and time
+shape=size(bandwidth)
+length=shape(1,2)
+time=1:1:length
+
+%moving average
+MA=movmean(bandwidth,5)
+MA=MA(3:length-3)
+result=[0,0,0,0,0,MA]
+
+%plotting
+figure
+hold on
+
+p1=plot(time, bandwidth)
+p2=plot(time, result)
+
+legend([p1, p2], {'acutal', 'prediction'}, 'Location', 'northeast');
+
+xlim([1200,1400])
+xlabel("time/s")
+ylabel("Mbits/s")
+
+error=(abs(result(6:4910)-bandwidth(6:length))./bandwidth(6:length))
+disp(sum(error)*100/(length-5))
