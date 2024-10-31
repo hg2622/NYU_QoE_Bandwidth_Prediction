@@ -1,0 +1,193 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import math
+from sklearn.metrics import mean_absolute_error
+import matplotlib.pyplot as plt
+from google.colab import drive
+from sklearn.preprocessing import MinMaxScaler
+def evaluate_and_count(predictions, actual_labels, threshold_ratio=0.5):
+    pred_range = torch.max(predictions) - torch.min(predictions)
+    threshold = threshold_ratio * pred_range
+
+    # Classify predictions as 1 if they exceed the threshold
+    predicted_class = (predictions >= threshold).float()
+
+    # Count total number of actual big drops (1s)
+    total_actual_ones = (actual_labels == 1).sum().item()
+
+    # Find indices where actual label is 1 (true sudden changes)
+    actual_one_indices = actual_labels == 1
+
+    # Find indices where actual label is 0 (no sudden change)
+    actual_zero_indices = actual_labels == 0
+
+    # Correctly predicted 1s
+    correct_predictions = (predicted_class[actual_one_indices] == actual_labels[actual_one_indices]).sum().item()
+
+    # Incorrectly predicted 1s when actual is 0
+    false_positives = (predicted_class[actual_zero_indices] == 1).sum().item()
+
+    # Accuracy based on correct 1 predictions over total actual 1's
+    accuracy = (correct_predictions / total_actual_ones) * 100 if total_actual_ones > 0 else 0
+
+    return total_actual_ones, correct_predictions, false_positives, accuracy
+# Check if CUDA is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Load data
+data = pd.read_csv("/content/drive/My Drive/7Train1.csv", header=None)
+
+# Function to add 'big drop' boolean label based on bandwidth difference
+def add_big_drop_label(bandwidth, threshold=5):
+    big_drop = []
+    for i in range(1, len(bandwidth)):
+        diff = abs(bandwidth[i] - bandwidth[i-1])
+        big_drop.append(1 if diff >= threshold else 0)
+    return [0] + big_drop  # Add initial 0 for first value
+
+
+# Prepare bandwidth and big drop labels
+bandwidth = data.iloc[:, 0].values  # Convert to NumPy array
+len_train = math.floor(len(bandwidth) * 0.8)
+
+scaler = MinMaxScaler(feature_range=(-1, 1))
+bandwidth_normalized = scaler.fit_transform(bandwidth.reshape(-1, 1))
+
+# Convert to PyTorch tensor and move to device
+data_tensor = torch.FloatTensor(bandwidth_normalized).view(-1, 1).to(device)
+
+# Add big drop labels to the dataset
+big_drop_labels = torch.tensor(add_big_drop_label(bandwidth), dtype=torch.float32).to(device)
+
+# Combine bandwidth and big drop labels
+input_features = np.column_stack((bandwidth, big_drop_labels.cpu().numpy()))  # Keep this as NumPy first, then convert
+data_tensor = torch.FloatTensor(input_features).to(device)
+
+# Function to create in-out sequences for bandwidth and big drop labels
+def create_inout_sequences_with_big_drop(input_data, big_drop_labels, window_size, predict_size):
+    inout_seq = []
+    L = len(input_data)
+    for i in range(L - window_size - predict_size+1):
+        train_seq = input_data[i:i + window_size, :]
+        train_label_big_drop = big_drop_labels[i + window_size:i + window_size + predict_size]
+        inout_seq.append((train_seq, train_label_big_drop))
+    return inout_seq
+
+# Define window size and batch size
+window_size = 5
+batch_size = 1
+predict_size = 1
+
+# Split into training and test sets
+train_inout_seq = create_inout_sequences_with_big_drop(data_tensor[:len_train], big_drop_labels[:len_train], window_size, 1)
+test_inout_seq = create_inout_sequences_with_big_drop(data_tensor[len_train:], big_drop_labels[len_train:], window_size, 1)
+
+# Custom dataset class
+class TimeSeriesDataset(Dataset):
+    def __init__(self, sequences):
+        self.sequences = sequences
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return self.sequences[idx]
+
+# Create DataLoader for training
+train_dataset = TimeSeriesDataset(train_inout_seq)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+
+# Adjusted LSTM Model for Big Drop Prediction
+class BigDropOnlyLSTM(nn.Module):
+    def __init__(self, input_size=2, hidden_layer_size=128, output_size_classification=1, num_layers=2, dropout=0.2):
+        super(BigDropOnlyLSTM, self).__init__()
+        self.hidden_layer_size = hidden_layer_size
+        self.num_layers = num_layers
+        self.lstm_change = nn.LSTM(input_size, hidden_layer_size, num_layers, dropout=dropout, batch_first=True)
+        self.linear_classification = nn.Linear(hidden_layer_size, output_size_classification)
+        self.sigmoid = nn.Sigmoid()  # For binary classification
+
+    def forward(self, input_seq, hidden_state):
+        lstm_out, hidden_state = self.lstm_change(input_seq, hidden_state)
+        lstm_out_last = lstm_out[:, -1, :]  # Take the last time step output
+        big_drop_prediction = self.sigmoid(self.linear_classification(lstm_out_last))  # Apply Sigmoid for probability
+        return big_drop_prediction, hidden_state
+
+    def init_hidden(self, batch_size):
+        return (torch.zeros(self.num_layers, batch_size, self.hidden_layer_size).to(device),
+                torch.zeros(self.num_layers, batch_size, self.hidden_layer_size).to(device))
+
+# Initialize the BigDrop model and move it to device (GPU)
+big_drop_model = BigDropOnlyLSTM(input_size=2, hidden_layer_size=128, num_layers=2, dropout=0.2).to(device)
+
+# Use BCE Loss for binary classification
+bce_loss_function = nn.BCELoss()  # Binary Cross Entropy Loss
+optimizer_big_drop = optim.Adam(big_drop_model.parameters(), lr=0.001)
+
+# Training loop (with BCE Loss)
+epochs = 10
+train_losses = []
+
+for epoch in range(epochs):
+    epoch_train_loss = 0
+    for seq, labels_big_drop in train_loader:
+        batch_size = seq.size(0)
+
+        # Initialize hidden state
+        hidden_state_big_drop = big_drop_model.init_hidden(batch_size)
+
+        optimizer_big_drop.zero_grad()
+
+        # Forward pass
+        seq = seq.view(batch_size, window_size, -1).to(device)
+        labels_big_drop = labels_big_drop.view(batch_size, -1).to(device)
+        big_drop_pred, hidden_state_big_drop = big_drop_model(seq, hidden_state_big_drop)
+
+        # Compute BCE loss for big drop prediction
+        loss = bce_loss_function(big_drop_pred, labels_big_drop)
+
+        # Backpropagation
+        loss.backward()
+        optimizer_big_drop.step()
+
+        epoch_train_loss += loss.item()
+
+    train_losses.append(epoch_train_loss / len(train_loader))
+    print(f'Epoch {epoch+1}/{epochs}, Loss: {epoch_train_loss:.8f}')
+
+
+# Testing loop and accuracy calculation
+big_drop_model.eval()
+test_predictions = []
+actual_labels = []
+hidden_state_big_drop = big_drop_model.init_hidden(1)  # Initialize hidden state
+
+for seq, label_big_drop in test_inout_seq:
+    seq = seq.view(1, window_size, 2).to(device)  # Adjust input size
+
+    with torch.no_grad():
+        # Forward pass
+        big_drop_pred, hidden_state_big_drop = big_drop_model(seq, hidden_state_big_drop)
+        test_predictions.append(big_drop_pred.item())
+        actual_labels.append(label_big_drop.item())
+
+# Convert predictions and actual labels to tensors
+test_predictions_tensor = torch.tensor(test_predictions).to(device)
+actual_labels_tensor = torch.tensor(actual_labels).to(device)
+
+# Evaluate and count the occurrences of 1s and predictions
+total_ones, correct_ones, false_positives, accuracy = evaluate_and_count(test_predictions_tensor, actual_labels_tensor)
+
+# Print the results
+print(f"Total number of sudden changes (actual 1's): {total_ones}")
+print(f"Correctly predicted sudden changes (1's): {correct_ones}")
+print(f"False positives (predicted 1 when actual is 0): {false_positives}")
+print(f"Accuracy for Big Drop Prediction (on actual 1s): {accuracy:.2f}%")
